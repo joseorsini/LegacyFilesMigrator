@@ -149,7 +149,8 @@ public class LegacyFilesMigrator{
             tmp.delete();
         try {
             java.io.File originalFile = fileAPI.getAssetIOFile(file);
-            FileUtil.copyFile(originalFile, tmp);
+            if(originalFile.exists())
+                FileUtil.copyFile(originalFile, tmp);
         } catch (IOException e) {
             Logger.error( this.getClass(), "Error processing Stream", e );
         }
