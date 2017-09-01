@@ -2,6 +2,7 @@ package com.dotmarketing.osgi.util;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 
 import com.dotmarketing.beans.Host;
 import com.dotmarketing.beans.Identifier;
@@ -14,6 +15,7 @@ import com.dotmarketing.business.PermissionAPI;
 import com.dotmarketing.business.UserAPI;
 import com.dotmarketing.business.Versionable;
 import com.dotmarketing.business.VersionableAPI;
+import com.dotmarketing.common.db.DotConnect;
 import com.dotmarketing.db.HibernateUtil;
 import com.dotmarketing.exception.DotDataException;
 import com.dotmarketing.exception.DotHibernateException;
@@ -85,6 +87,7 @@ public class LegacyFilesMigrator {
 						+ "===== Initializing conversion of Legacy Files to Files as Content =====\n"
 						+ "=======================================================================\n");
 		try {
+			recreateMissingParentPath();
 			sysUser = userAPI.getSystemUser();
 			fileAssetContentType = getFileAssetContentType("FileAsset", sysUser);
 			int migrated = 0;
@@ -148,6 +151,35 @@ public class LegacyFilesMigrator {
 				HibernateUtil.closeSession();
 			} catch (DotHibernateException e) {
 				Logger.error(this.getClass(), "An error occurred when closing the Hibernate session.", e);
+			}
+		}
+	}
+
+	/**
+	 * Sets a valid parent path for legacy files whose parent path is null or
+	 * empty, which can be caused by different circumstances. This is a data
+	 * inconsistency and must be fixed before migrating such legacy files to
+	 * files as content.
+	 * 
+	 * @throws DotDataException
+	 *             An error occurred when updating the records in the data
+	 *             source.
+	 */
+	private void recreateMissingParentPath() throws DotDataException {
+		final DotConnect dc = new DotConnect();
+		final String whereClause = "WHERE parent_path IS NULL OR parent_path = '' OR parent_path = ' ' AND asset_type = 'file_asset'";
+		String query = "SELECT id FROM identifier " + whereClause;
+		dc.setSQL(query);
+		List<Map<String, Object>> results = dc.loadObjectResults();
+		if (!results.isEmpty()) {
+			Logger.info(this.getClass(), " \n=== A total of " + results.size()
+					+ " legacy files have an invalid parent path. Fixing data... ===");
+			query = "UPDATE identifier SET parent_path = '/' " + whereClause;
+			dc.setSQL(query);
+			dc.loadResult();
+			for (Map<String, Object> record : results) {
+				final String identifier = record.get("id").toString();
+				CacheLocator.getIdentifierCache().removeFromCacheByIdentifier(identifier);
 			}
 		}
 	}
