@@ -1,9 +1,11 @@
 package com.dotmarketing.osgi.util;
 
 import java.io.IOException;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
+import com.dotcms.repackage.org.apache.commons.io.FilenameUtils;
 import com.dotmarketing.beans.Host;
 import com.dotmarketing.beans.Identifier;
 import com.dotmarketing.beans.VersionInfo;
@@ -21,6 +23,8 @@ import com.dotmarketing.exception.DotDataException;
 import com.dotmarketing.exception.DotHibernateException;
 import com.dotmarketing.exception.DotSecurityException;
 import com.dotmarketing.portlets.contentlet.business.ContentletAPI;
+import com.dotmarketing.portlets.contentlet.business.DotContentletStateException;
+import com.dotmarketing.portlets.contentlet.business.DotContentletValidationException;
 import com.dotmarketing.portlets.contentlet.business.HostAPI;
 import com.dotmarketing.portlets.contentlet.model.Contentlet;
 import com.dotmarketing.portlets.files.business.FileAPI;
@@ -118,9 +122,7 @@ public class LegacyFilesMigrator {
 							deleteLegacyFile(legacyFile);
 							migrated++;
 						} else {
-							final List<Versionable> legacyFileVersions = findAllVersions(legacyFile);
 							if (migrateLegacyFile(legacyFile)) {
-								deleteAllVersions(legacyFileVersions);
 								migrated++;
 							}
 						}
@@ -132,8 +134,10 @@ public class LegacyFilesMigrator {
 							" \n \nAll Legacy files under site '" + site.getHostname() + "' have been processed.\n"
 									+ "**********************************************************************\n");
 				}
-				Logger.info(this.getClass(), " \n" + "\n-> Total processed files = " + migrated + "\n \n"
-						+ "All legacy files have been processed. Please undeploy this plugin now.\n" + " \n");
+				Logger.info(this.getClass(),
+						" \n" + "\n-> Total processed files = " + migrated + "\n \n"
+								+ "All legacy files have been processed. Please undeploy the Legacy File Migrator plugin now.\n"
+								+ " \n");
 			} else {
 				Logger.error(this.getClass(),
 						" \nAn error occurred: No Sites could be retrieved. Have you tried re-indexing your contents first?\n");
@@ -210,10 +214,9 @@ public class LegacyFilesMigrator {
 	}
 
 	/**
-	 * Performs the migration of the legacy file to the new file as content.
-	 * This method deletes only the current working version of the Legacy File.
-	 * The deletion of other potential versions of the file is handled
-	 * separately.
+	 * Performs the migration of the legacy file to the new file as content and
+	 * takes care of the cleanup process for the legacy data: Removing the
+	 * legacy file form the file system, permission and cache cleanup, etc.
 	 * 
 	 * @param file
 	 *            - The legacy file to migrate.
@@ -222,44 +225,123 @@ public class LegacyFilesMigrator {
 	 *             An error occurred when migrating the specified Legacy File.
 	 */
 	public boolean migrateLegacyFile(final File file) throws Exception {
+		// Retrieve asset and version information of the legacy file to create
+		// the new content file
 		final Identifier legacyIdentifier = identifierAPI.find(file);
-		final VersionInfo vInfo = versionableAPI.getVersionInfo(legacyIdentifier.getId());
+		final VersionInfo versionInfo = versionableAPI.getVersionInfo(legacyIdentifier.getId());
+		List<Versionable> legacyFileVersions = findAllVersions(file);
 		final File working = (File) versionableAPI.findWorkingVersion(legacyIdentifier, sysUser,
 				!RESPECT_ANON_PERMISSIONS);
 		final java.io.File fileReferenceInFS = fileAPI.getAssetIOFile(file);
 		final Contentlet cworking = migrateLegacyFileData(file);
 		Contentlet clive = null;
 		setHostFolderValues(cworking, legacyIdentifier);
-
-		if (vInfo.getLiveInode() != null && !vInfo.getLiveInode().equals(vInfo.getWorkingInode())) {
+		// Migrate and clear permissions on the legacy file
+		if (versionInfo.getLiveInode() != null && !versionInfo.getLiveInode().equals(versionInfo.getWorkingInode())) {
 			final File live = (File) versionableAPI.findLiveVersion(legacyIdentifier, sysUser,
 					!RESPECT_ANON_PERMISSIONS);
 			clive = migrateLegacyFileData(live);
 			setHostFolderValues(clive, legacyIdentifier);
 		}
-
 		if (!permissionAPI.isInheritingPermissions(working)) {
 			final boolean bitPermissions = Boolean.TRUE;
 			final boolean onlyIndividualPermissions = Boolean.TRUE;
 			final boolean forceLoadFromDB = Boolean.TRUE;
 			permissionAPI.getPermissions(working, bitPermissions, onlyIndividualPermissions, forceLoadFromDB);
 		}
+		// Delete the legacy file and use its working Inode to create the new
+		// one
+		final String workingInode = working.getInode();
 		fileAPI.delete(working, sysUser, !RESPECT_FRONTEND_ROLES);
 		fileReferenceInFS.delete();
-
-		HibernateUtil.getSession().clear();
-		CacheLocator.getIdentifierCache().removeFromCacheByIdentifier(legacyIdentifier.getId());
-
-		if (clive != null) {
-			final Contentlet cclive = contAPI.checkin(clive, sysUser, !RESPECT_FRONTEND_ROLES);
-			contAPI.publish(cclive, sysUser, !RESPECT_FRONTEND_ROLES);
-		} else {
-			final Contentlet ccworking = contAPI.checkin(cworking, sysUser, !RESPECT_FRONTEND_ROLES);
-			if (vInfo.getLiveInode() != null && vInfo.getLiveInode().equals(ccworking.getInode())) {
-				contAPI.publish(ccworking, sysUser, !RESPECT_FRONTEND_ROLES);
+		Iterator<Versionable> it = legacyFileVersions.iterator();
+		while (it.hasNext()) {
+			Versionable version = it.next();
+			if (workingInode.equals(version.getInode())) {
+				// Delete all the legacy file versions EXCEPT FOR the working
+				// Inode, as it is used in the new content file
+				it.remove();
 			}
 		}
+		HibernateUtil.getSession().clear();
+		CacheLocator.getIdentifierCache().removeFromCacheByIdentifier(legacyIdentifier.getId());
+		// Check in the new content file
+		if (clive != null) {
+			try {
+				checkinLive(clive);
+			} catch (DotContentletValidationException e) {
+				Logger.warn(this, "\nLegacy File '" + legacyIdentifier.getPath()
+						+ "' has invalid fields. Re-trying to check in without validation...");
+				clive.setProperty(Contentlet.DONT_VALIDATE_ME, Boolean.TRUE);
+				checkinLive(clive);
+				Logger.warn(this, "Done.");
+			}
+		} else {
+			try {
+				checkinWorking(cworking, versionInfo);
+			} catch (DotContentletValidationException e) {
+				Logger.warn(this, "\nLegacy File '" + legacyIdentifier.getPath()
+						+ "' has invalid fields. Re-trying to check in without validation...");
+				cworking.setProperty(Contentlet.DONT_VALIDATE_ME, Boolean.TRUE);
+				checkinWorking(cworking, versionInfo);
+				Logger.warn(this, "Done.");
+			}
+		}
+		// Finally, delete all legacy file versions, if any
+		deleteAllVersions(legacyFileVersions);
 		return true;
+	}
+
+	/**
+	 * Checks in the live version of the specified file as content.
+	 * 
+	 * @param clive
+	 *            - The live version of the content.
+	 * @throws DotContentletValidationException
+	 *             One or more fields in the content have invalid values.
+	 * @throws DotContentletStateException
+	 *             An error occurred when saving the content.
+	 * @throws IllegalArgumentException
+	 *             An error occurred when saving the content.
+	 * @throws DotDataException
+	 *             An error occurred when interacting with the data source.
+	 * @throws DotSecurityException
+	 *             The specified user does not have permissions to perform this
+	 *             action.
+	 */
+	private void checkinLive(final Contentlet clive) throws DotContentletValidationException,
+			DotContentletStateException, IllegalArgumentException, DotDataException, DotSecurityException {
+		final Contentlet cclive = contAPI.checkin(clive, sysUser, !RESPECT_FRONTEND_ROLES);
+		contAPI.publish(cclive, sysUser, !RESPECT_FRONTEND_ROLES);
+	}
+
+	/**
+	 * Checks in the working version of the specified file as content. Its
+	 * version info will determine whether the content will be published or not.
+	 * 
+	 * @param cworking
+	 *            - The working version of the content.
+	 * @param vInfo
+	 *            - The version info of the content.
+	 * @throws DotContentletValidationException
+	 *             One or more fields in the content have invalid values.
+	 * @throws DotContentletStateException
+	 *             An error occurred when saving the content.
+	 * @throws IllegalArgumentException
+	 *             An error occurred when saving the content.
+	 * @throws DotDataException
+	 *             An error occurred when interacting with the data source.
+	 * @throws DotSecurityException
+	 *             The specified user does not have permissions to perform this
+	 *             action.
+	 */
+	private void checkinWorking(final Contentlet cworking, final VersionInfo vInfo)
+			throws DotContentletValidationException, DotContentletStateException, IllegalArgumentException,
+			DotDataException, DotSecurityException {
+		final Contentlet ccworking = contAPI.checkin(cworking, sysUser, !RESPECT_FRONTEND_ROLES);
+		if (vInfo.getLiveInode() != null && vInfo.getLiveInode().equals(ccworking.getInode())) {
+			contAPI.publish(ccworking, sysUser, !RESPECT_FRONTEND_ROLES);
+		}
 	}
 
 	/**
@@ -299,19 +381,19 @@ public class LegacyFilesMigrator {
 	 *             An error occurred when setting some contentlet's properties.
 	 */
 	private Contentlet migrateLegacyFileData(final File file) throws Exception {
-		Contentlet newCon = new Contentlet();
-		newCon.setStructureInode(fileAssetContentType.getInode());
-		newCon.setLanguageId(langAPI.getDefaultLanguage().getId());
-		newCon.setInode(file.getInode());
-		newCon.setIdentifier(file.getIdentifier());
-		newCon.setModUser(file.getModUser());
-		newCon.setModDate(file.getModDate());
-		newCon.setStringProperty("title", file.getFileName());
-		newCon.setStringProperty("fileName", file.getFileName());
-		newCon.setStringProperty("description", file.getTitle());
-		java.io.File tmp = copyFileToTempFolder(file);
-		newCon.setBinary("fileAsset", tmp);
-		return newCon;
+		final Contentlet fileAsContent = new Contentlet();
+		fileAsContent.setStructureInode(fileAssetContentType.getInode());
+		fileAsContent.setLanguageId(langAPI.getDefaultLanguage().getId());
+		fileAsContent.setInode(file.getInode());
+		fileAsContent.setIdentifier(file.getIdentifier());
+		fileAsContent.setModUser(file.getModUser());
+		fileAsContent.setModDate(file.getModDate());
+		fileAsContent.setStringProperty("title", file.getFileName());
+		fileAsContent.setStringProperty("fileName", file.getFileName());
+		fileAsContent.setStringProperty("description", file.getTitle());
+		final java.io.File tmp = copyFileToTempFolder(file);
+		fileAsContent.setBinary("fileAsset", tmp);
+		return fileAsContent;
 	}
 
 	/**
@@ -351,9 +433,12 @@ public class LegacyFilesMigrator {
 	 *            - The Legacy File.
 	 * @return The list of Legacy File versions.
 	 * @throws DotStateException
+	 *             An error occurred when retrieving the information.
 	 * @throws DotDataException
 	 *             An error occurred when accessing the data source.
 	 * @throws DotSecurityException
+	 *             The specified user does not have permissions to perform this
+	 *             action.
 	 */
 	private List<Versionable> findAllVersions(final File file)
 			throws DotStateException, DotDataException, DotSecurityException {
@@ -376,7 +461,38 @@ public class LegacyFilesMigrator {
 				final File legacyFile = (File) versionable;
 				final java.io.File fileReference = fileAPI.getAssetIOFile(legacyFile);
 				if (null != fileReference && fileReference.exists()) {
-					fileReference.delete();
+					deleteFilesInFileSystem(fileReference);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Removes the original legacy file and the versions that were created via
+	 * the WYSIWYG, the Image Editor, or the Image Servlet. For example, in the
+	 * {@code /assets/} folder, a legacy file called
+	 * {@code 2cb2a266-1784-4d12-8738-b59fd85910d1.jpg} can have the following
+	 * versions:
+	 * 
+	 * <pre>
+	 * 2cb2a266-1784-4d12-8738-b59fd85910d1_resized_250_w_974.jpg
+	 * 2cb2a266-1784-4d12-8738-b59fd85910d1_thumb_100_100_255_255_255.jpg
+	 * dotGenerated_2cb2a266-1784-4d12-8738-b59fd85910d1250_w_974.jpg
+	 * </pre>
+	 * 
+	 * The original file name will be taken as a filter to find the other
+	 * "edited" versions and the parent folder where they are located.
+	 * 
+	 * @param fileReference
+	 *            - The reference to the original legacy file.
+	 */
+	private void deleteFilesInFileSystem(java.io.File fileReference) {
+		final String legacyFileName = fileReference.getName();
+		final java.io.File parentDir = fileReference.getParentFile();
+		if (parentDir.isDirectory()) {
+			for (java.io.File file : parentDir.listFiles()) {
+				if (!file.isDirectory() && file.getName().contains(FilenameUtils.removeExtension(legacyFileName))) {
+					file.delete();
 				}
 			}
 		}
