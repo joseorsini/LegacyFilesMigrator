@@ -230,65 +230,72 @@ public class LegacyFilesMigrator {
 		final Identifier legacyIdentifier = identifierAPI.find(file);
 		final VersionInfo versionInfo = versionableAPI.getVersionInfo(legacyIdentifier.getId());
 		List<Versionable> legacyFileVersions = findAllVersions(file);
-		final File working = (File) versionableAPI.findWorkingVersion(legacyIdentifier, sysUser,
-				!RESPECT_ANON_PERMISSIONS);
+		
 		final java.io.File fileReferenceInFS = fileAPI.getAssetIOFile(file);
-		final Contentlet cworking = migrateLegacyFileData(file);
-		Contentlet clive = null;
-		setHostFolderValues(cworking, legacyIdentifier);
-		// Migrate and clear permissions on the legacy file
-		if (versionInfo.getLiveInode() != null && !versionInfo.getLiveInode().equals(versionInfo.getWorkingInode())) {
-			final File live = (File) versionableAPI.findLiveVersion(legacyIdentifier, sysUser,
-					!RESPECT_ANON_PERMISSIONS);
-			clive = migrateLegacyFileData(live);
-			setHostFolderValues(clive, legacyIdentifier);
-		}
-		if (!permissionAPI.isInheritingPermissions(working)) {
-			final boolean bitPermissions = Boolean.TRUE;
-			final boolean onlyIndividualPermissions = Boolean.TRUE;
-			final boolean forceLoadFromDB = Boolean.TRUE;
-			permissionAPI.getPermissions(working, bitPermissions, onlyIndividualPermissions, forceLoadFromDB);
-		}
-		// Delete the legacy file and use its working Inode to create the new
-		// one
-		final String workingInode = working.getInode();
-		fileAPI.delete(working, sysUser, !RESPECT_FRONTEND_ROLES);
-		fileReferenceInFS.delete();
-		Iterator<Versionable> it = legacyFileVersions.iterator();
-		while (it.hasNext()) {
-			Versionable version = it.next();
-			if (workingInode.equals(version.getInode())) {
-				// Delete all the legacy file versions EXCEPT FOR the working
-				// Inode, as it is used in the new content file
-				it.remove();
-			}
-		}
-		HibernateUtil.getSession().clear();
-		CacheLocator.getIdentifierCache().removeFromCacheByIdentifier(legacyIdentifier.getId());
-		// Check in the new content file
-		if (clive != null) {
-			try {
-				checkinLive(clive);
-			} catch (DotContentletValidationException e) {
-				Logger.warn(this, "\nLegacy File '" + legacyIdentifier.getPath()
-						+ "' has invalid fields. Re-trying to check in without validation...");
-				clive.setProperty(Contentlet.DONT_VALIDATE_ME, Boolean.TRUE);
-				checkinLive(clive);
-				Logger.warn(this, "Done.");
-			}
+		if (null == fileReferenceInFS || !fileReferenceInFS.exists()) {
+			Logger.warn(this,
+					"\nLegacy File '" + legacyIdentifier.getPath() + "' has no associated binary file. Deleting...");
+			deleteLegacyFile(file);
 		} else {
-			try {
-				checkinWorking(cworking, versionInfo);
-			} catch (DotContentletValidationException e) {
-				Logger.warn(this, "\nLegacy File '" + legacyIdentifier.getPath()
-						+ "' has invalid fields. Re-trying to check in without validation...");
-				cworking.setProperty(Contentlet.DONT_VALIDATE_ME, Boolean.TRUE);
-				checkinWorking(cworking, versionInfo);
-				Logger.warn(this, "Done.");
+			final File working = (File) versionableAPI.findWorkingVersion(legacyIdentifier, sysUser,
+					!RESPECT_ANON_PERMISSIONS);
+			final Contentlet cworking = migrateLegacyFileData(file);
+			Contentlet clive = null;
+			setHostFolderValues(cworking, legacyIdentifier);
+			// Migrate and clear permissions on the legacy file
+			if (versionInfo.getLiveInode() != null && !versionInfo.getLiveInode().equals(versionInfo.getWorkingInode())) {
+				final File live = (File) versionableAPI.findLiveVersion(legacyIdentifier, sysUser,
+						!RESPECT_ANON_PERMISSIONS);
+				clive = migrateLegacyFileData(live);
+				setHostFolderValues(clive, legacyIdentifier);
 			}
+			if (!permissionAPI.isInheritingPermissions(working)) {
+				final boolean bitPermissions = Boolean.TRUE;
+				final boolean onlyIndividualPermissions = Boolean.TRUE;
+				final boolean forceLoadFromDB = Boolean.TRUE;
+				permissionAPI.getPermissions(working, bitPermissions, onlyIndividualPermissions, forceLoadFromDB);
+			}
+			// Delete the legacy file and use its working Inode to create the new
+			// one
+			final String workingInode = working.getInode();
+			fileAPI.delete(working, sysUser, !RESPECT_FRONTEND_ROLES);
+			fileReferenceInFS.delete();
+			Iterator<Versionable> it = legacyFileVersions.iterator();
+			while (it.hasNext()) {
+				Versionable version = it.next();
+				if (workingInode.equals(version.getInode())) {
+					// Delete all the legacy file versions EXCEPT FOR the working
+					// Inode, as it is used in the new content file
+					it.remove();
+				}
+			}
+			HibernateUtil.getSession().clear();
+			CacheLocator.getIdentifierCache().removeFromCacheByIdentifier(legacyIdentifier.getId());
+			// Check in the new content file
+			if (clive != null) {
+				try {
+					checkinLive(clive);
+				} catch (DotContentletValidationException e) {
+					Logger.warn(this, "\nLegacy File '" + legacyIdentifier.getPath()
+							+ "' has invalid fields. Re-trying to check in without validation...");
+					clive.setProperty(Contentlet.DONT_VALIDATE_ME, Boolean.TRUE);
+					checkinLive(clive);
+					Logger.warn(this, "Done.");
+				}
+			} else {
+				try {
+					checkinWorking(cworking, versionInfo);
+				} catch (DotContentletValidationException e) {
+					Logger.warn(this, "\nLegacy File '" + legacyIdentifier.getPath()
+							+ "' has invalid fields. Re-trying to check in without validation...");
+					cworking.setProperty(Contentlet.DONT_VALIDATE_ME, Boolean.TRUE);
+					checkinWorking(cworking, versionInfo);
+					Logger.warn(this, "Done.");
+				}
+			}
+			// Finally, delete all legacy file versions, if any
+			deleteAllVersions(legacyFileVersions);
 		}
-		// Finally, delete all legacy file versions, if any
-		deleteAllVersions(legacyFileVersions);
 		return true;
 	}
 
@@ -422,8 +429,11 @@ public class LegacyFilesMigrator {
 	 *             An error occurred when deleting the data.
 	 */
 	private void deleteLegacyFile(final File file) throws Exception {
+		final File working = (File) versionableAPI.findWorkingVersion(file.getIdentifier(), sysUser,
+				!RESPECT_ANON_PERMISSIONS);
 		final List<Versionable> legacyFileVersions = findAllVersions(file);
 		deleteAllVersions(legacyFileVersions);
+		fileAPI.delete(working, sysUser, !RESPECT_FRONTEND_ROLES);
 	}
 
 	/**
